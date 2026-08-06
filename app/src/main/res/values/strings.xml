@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">FocusGuard</string>
+    <string name="accessibility_service_name">FocusGuard 前台应用监测</string>
+    <string name="accessibility_service_description">仅在本机检测当前前台应用包名，并按用户设置的确定性时间规则执行提醒与拦截；不读取聊天、网页或键盘内容。</string>
+</resources>

@@ -1,0 +1,5 @@
+<resources>
+    <color name="focusguard_blue">#155A8A</color>
+    <color name="focusguard_dark">#0D1B2A</color>
+    <color name="focusguard_red">#FF3B30</color>
+</resources>
