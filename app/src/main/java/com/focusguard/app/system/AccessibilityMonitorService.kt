@@ -84,7 +84,6 @@ class AccessibilityMonitorService : AccessibilityService() {
         val keyguard = getSystemService(KeyguardManager::class.java)
         if (!power.isInteractive || keyguard.isKeyguardLocked) return
         val pkg = foregroundPackageFrom(event) ?: return
-        if (pkg != SYSTEM_UI_PACKAGE) foregroundRecoveryJob?.cancel()
         orchestrator.onForegroundPackage(pkg) {
             performGlobalAction(GLOBAL_ACTION_HOME)
         }
@@ -170,6 +169,7 @@ class AccessibilityMonitorService : AccessibilityService() {
     private fun scheduleForegroundRecovery(reason: String) {
         foregroundRecoveryJob?.cancel()
         foregroundRecoveryJob = serviceScope.launch {
+            var lastRecoveredPackage: String? = null
             RECOVERY_DELAYS_MS.forEachIndexed { attempt, waitMillis ->
                 if (waitMillis > 0L) delay(waitMillis)
                 if (!isDeviceReadyForMonitoring()) return@forEachIndexed
@@ -182,7 +182,7 @@ class AccessibilityMonitorService : AccessibilityService() {
                     ?: usageStatsInspector.mostRecentForegroundPackage(RECOVERY_LOOKBACK_MS)
                         ?.takeUnless { it == SYSTEM_UI_PACKAGE }
 
-                if (recoveredPackage != null) {
+                if (recoveredPackage != null && recoveredPackage != lastRecoveredPackage) {
                     orchestrator.onForegroundPackage(recoveredPackage) {
                         performGlobalAction(GLOBAL_ACTION_HOME)
                     }
@@ -191,7 +191,7 @@ class AccessibilityMonitorService : AccessibilityService() {
                         packageName = recoveredPackage,
                         detail = "$reason:${attempt + 1}"
                     )
-                    return@launch
+                    lastRecoveredPackage = recoveredPackage
                 }
             }
         }
@@ -207,7 +207,9 @@ class AccessibilityMonitorService : AccessibilityService() {
         private const val SYSTEM_UI_PACKAGE = "com.android.systemui"
         private const val HEARTBEAT_INTERVAL_MS = 10 * 60_000L
         private const val RECOVERY_LOOKBACK_MS = 5 * 60_000L
-        private val RECOVERY_DELAYS_MS = longArrayOf(0L, 250L, 1_000L, 2_500L)
+        // Event-bounded retries cover SystemUI -> launcher -> restored app transitions after
+        // unlock without keeping a permanent polling loop alive.
+        private val RECOVERY_DELAYS_MS = longArrayOf(0L, 150L, 350L, 700L, 1_400L, 2_400L)
 
         @Volatile
         private var connectedInstance: WeakReference<AccessibilityMonitorService>? = null

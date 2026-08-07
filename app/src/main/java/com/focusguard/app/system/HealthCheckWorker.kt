@@ -80,6 +80,7 @@ class HealthCheckWorker(
                 ) {
                     settingsStore.updateServiceState(true)
                 }
+                AccessibilityMonitorService.requestForegroundRecheck("HEALTH_CHECK")
                 NotificationHelper.clearProtectionFailure(applicationContext)
             }
             ServiceHealthStatus.RECENT_HEARTBEAT -> {

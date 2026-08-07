@@ -1,17 +1,20 @@
 package com.focusguard.app.system
 
 import android.content.Context
+import com.focusguard.app.data.db.LockStateEntity
 import com.focusguard.app.data.db.RuleEntity
 import com.focusguard.app.data.db.UsageSessionEntity
 import com.focusguard.app.data.prefs.SettingsStore
 import com.focusguard.app.data.repo.FocusGuardRepository
 import com.focusguard.app.domain.DateBoundary
+import com.focusguard.app.domain.PersistedLockValidator
 import com.focusguard.app.domain.RuleContext
 import com.focusguard.app.domain.ScheduleMatcher
 import com.focusguard.app.domain.RuleDecision
 import com.focusguard.app.domain.RuleEngine
 import com.focusguard.app.util.EndReasons
 import com.focusguard.app.util.EventCodes
+import com.focusguard.app.util.LockTypes
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -19,6 +22,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -60,6 +64,14 @@ class ForegroundOrchestrator @Inject constructor(
     private var lastForegroundPackage: String? = null
     private var performHomeAction: () -> Unit = { }
 
+    init {
+        scope.launch {
+            repository.configurationChanges.collect { packageName ->
+                mutex.withLock { handleConfigurationChanged(packageName) }
+            }
+        }
+    }
+
     fun onForegroundPackage(packageName: String, performHome: () -> Unit) {
         scope.launch {
             mutex.withLock {
@@ -95,12 +107,9 @@ class ForegroundOrchestrator @Inject constructor(
         val settings = settingsStore.settings.first()
         if (!settings.monitoringEnabled) return
 
-        val existingLock = repository.getLock()
+        val existingLock = validatedExistingLock()
         if (existingLock != null) {
-            val remaining = repository.remainingLockMillis(existingLock)
-            if (remaining <= 0L) {
-                repository.clearLock("NATURAL_END")
-            } else if (
+            if (
                 (existingLock.globalScope || existingLock.triggerPackage == packageName) &&
                 !SystemWhitelist.isSafetyCritical(context, packageName) &&
                 !repository.validOverride(packageName)
@@ -120,6 +129,77 @@ class ForegroundOrchestrator @Inject constructor(
         repository.audit(EventCodes.APP_FOREGROUND, packageName)
         startOrResume(packageName, app.appLabel, rule)
         evaluateActive(performHome)
+    }
+
+    private suspend fun validatedExistingLock(): LockStateEntity? {
+        val lock = repository.getLock() ?: return null
+        if (repository.remainingLockMillis(lock) <= 0L) {
+            repository.clearLock("NATURAL_END")
+            return null
+        }
+
+        val triggerPackage = lock.triggerPackage
+        if (triggerPackage.isNullOrBlank()) {
+            repository.clearLock("INVALID_TRIGGER")
+            return null
+        }
+
+        val app = repository.getManagedApp(triggerPackage)
+        val rule = repository.getRule(triggerPackage)
+        val nowWall = clock.wallMillis()
+        val settings = settingsStore.settings.first()
+        val scheduleMatchesLock = if (lock.lockType == LockTypes.SCHEDULE) {
+            val evaluation = ScheduleMatcher.evaluate(repository.getSchedules(triggerPackage), nowWall)
+            evaluation.blocked && evaluation.endWall == lock.endWall
+        } else {
+            false
+        }
+        val dailyUsed = if (lock.lockType == LockTypes.DAILY) {
+            repository.dailyUsed(triggerPackage, nowWall, settings.resetMinute)
+        } else {
+            0L
+        }
+        val valid = PersistedLockValidator.isValid(
+            lockType = lock.lockType,
+            appEnabled = app?.let { it.enabled && !it.isWhitelist } == true,
+            ruleEnabled = rule?.enabled == true,
+            scheduleMatchesLock = scheduleMatchesLock,
+            dailyEnabled = rule?.dailyEnabled == true,
+            dailyUsedSec = dailyUsed,
+            dailyLimitSec = rule?.dailyLimitSec ?: Long.MAX_VALUE,
+            continuousEnabled = rule?.continuousEnabled == true
+        )
+        if (!valid) {
+            repository.clearLock("RULE_REEVALUATED")
+            return null
+        }
+        return lock
+    }
+
+    private suspend fun handleConfigurationChanged(packageName: String) {
+        validatedExistingLock()
+
+        pending.remove(packageName)?.let { item ->
+            item.closeJob.cancel()
+            repository.checkpointSession(
+                item.active.session,
+                segmentSec = 0,
+                resetMinute = settingsStore.settings.first().resetMinute,
+                close = true,
+                endReason = EndReasons.RULE_CHANGED
+            )
+        }
+
+        val current = active ?: return
+        if (current.packageName != packageName) return
+        val app = repository.getManagedApp(packageName)
+        val rule = repository.getRule(packageName)
+        if (app == null || !app.enabled || app.isWhitelist || rule == null || !rule.enabled) {
+            closeActiveImmediately(EndReasons.RULE_CHANGED)
+            return
+        }
+        active = current.copy(appLabel = app.appLabel, rule = rule)
+        evaluateActive(performHomeAction)
     }
 
     private suspend fun startOrResume(packageName: String, label: String, rule: RuleEntity) {
@@ -220,6 +300,10 @@ class ForegroundOrchestrator @Inject constructor(
             delay(delayMs)
             mutex.withLock {
                 if (active?.packageName == snapshot.packageName) {
+                    // The scheduled monitor is the current coroutine. Clear the reference before
+                    // evaluation so the blocking path cannot cancel itself before persisting the
+                    // session and launching BlockActivity.
+                    monitorJob = null
                     evaluateActive(performHomeAction)
                 }
             }
@@ -264,6 +348,16 @@ class ForegroundOrchestrator @Inject constructor(
 
     private suspend fun evaluateActive(performHome: () -> Unit) {
         var current = active ?: return
+        val app = repository.getManagedApp(current.packageName)
+        val latestRule = repository.getRule(current.packageName)
+        if (app == null || !app.enabled || app.isWhitelist || latestRule == null || !latestRule.enabled) {
+            closeActiveImmediately(EndReasons.RULE_CHANGED)
+            return
+        }
+        if (current.rule != latestRule || current.appLabel != app.appLabel) {
+            current = current.copy(appLabel = app.appLabel, rule = latestRule)
+            active = current
+        }
         val nowElapsed = clock.elapsedMillis()
         val nowWall = clock.wallMillis()
         val settings = settingsStore.settings.first()
@@ -344,6 +438,7 @@ class ForegroundOrchestrator @Inject constructor(
             is RuleDecision.BlockDaily,
             is RuleDecision.BlockSchedule -> {
                 monitorJob?.cancel()
+                monitorJob = null
                 repository.checkpointSession(
                     current.session,
                     segmentSec,

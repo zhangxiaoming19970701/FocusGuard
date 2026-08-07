@@ -15,6 +15,8 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import javax.inject.Inject
 
 data class RuleEditorUiState(
@@ -31,6 +33,7 @@ class RuleEditorViewModel @Inject constructor(
 ) : ViewModel() {
     val packageName: String = requireNotNull(savedStateHandle["packageName"])
     private val message = kotlinx.coroutines.flow.MutableStateFlow<String?>(null)
+    private val configurationMutex = Mutex()
 
     val uiState: StateFlow<RuleEditorUiState> = combine(
         repository.managedApps.map { list -> list.firstOrNull { it.packageName == packageName } },
@@ -42,8 +45,10 @@ class RuleEditorViewModel @Inject constructor(
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), RuleEditorUiState())
 
     fun updateRule(transform: (RuleEntity) -> RuleEntity) = viewModelScope.launch {
-        val current = repository.getRule(packageName) ?: RuleEntity(packageName = packageName)
-        repository.upsertRule(transform(current))
+        configurationMutex.withLock {
+            val current = repository.getRule(packageName) ?: RuleEntity(packageName = packageName)
+            repository.upsertRule(transform(current))
+        }
     }
 
     fun addSchedule(mode: String, daysMask: Int, startText: String, endText: String) = viewModelScope.launch {
@@ -54,27 +59,29 @@ class RuleEditorViewModel @Inject constructor(
             daysMask == 0 -> message.value = "请至少选择一天"
             start == null || end == null -> message.value = "时间格式应为 HH:mm"
             else -> {
-                val candidate = ScheduleWindowEntity(
-                    packageName = packageName,
-                    mode = mode,
-                    daysMask = daysMask,
-                    startMinute = start,
-                    endMinute = end,
-                    label = if (mode == ScheduleModes.BLOCK) "禁用时段" else "允许时段"
-                )
-                val overlaps = repository.getSchedules(packageName).any { schedulesOverlap(it, candidate) }
-                if (overlaps) {
-                    message.value = "该时段与现有规则重叠，请先调整或删除冲突时段"
-                } else {
-                    repository.upsertSchedule(candidate)
-                    message.value = "时段已保存"
+                configurationMutex.withLock {
+                    val candidate = ScheduleWindowEntity(
+                        packageName = packageName,
+                        mode = mode,
+                        daysMask = daysMask,
+                        startMinute = start,
+                        endMinute = end,
+                        label = if (mode == ScheduleModes.BLOCK) "禁用时段" else "允许时段"
+                    )
+                    val overlaps = repository.getSchedules(packageName).any { schedulesOverlap(it, candidate) }
+                    if (overlaps) {
+                        message.value = "该时段与现有规则重叠，请先调整或删除冲突时段"
+                    } else {
+                        repository.upsertSchedule(candidate)
+                        message.value = "时段已保存"
+                    }
                 }
             }
         }
     }
 
     fun deleteSchedule(window: ScheduleWindowEntity) = viewModelScope.launch {
-        repository.deleteSchedule(window)
+        configurationMutex.withLock { repository.deleteSchedule(window) }
     }
 
     fun clearMessage() { message.value = null }
