@@ -88,22 +88,43 @@ class BlockCoordinator @Inject constructor(
     }
 
     private suspend fun enforce(lock: LockStateEntity, performHome: () -> Unit) {
-        withContext(Dispatchers.Main.immediate) { performHome() }
+        if (BlockActivity.isVisible) return
         val now = clock.elapsedMillis()
         if (now - lastLaunchElapsed < 400L) return
         lastLaunchElapsed = now
-        delay(80L)
-        withContext(Dispatchers.Main.immediate) {
-            val intent = Intent(context, BlockActivity::class.java).apply {
-                addFlags(
-                    Intent.FLAG_ACTIVITY_NEW_TASK or
-                        Intent.FLAG_ACTIVITY_CLEAR_TOP or
-                        Intent.FLAG_ACTIVITY_SINGLE_TOP or
-                        Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS
-                )
-                putExtra(BlockActivity.EXTRA_LOCK_TYPE, lock.lockType)
-            }
-            context.startActivity(intent)
+
+        val launched = withContext(Dispatchers.Main.immediate) { launchBlockActivity(lock) }
+        if (!launched) {
+            withContext(Dispatchers.Main.immediate) { performHome() }
+            return
         }
+
+        // Some vendor ROMs reject a background activity launch even though startActivity does
+        // not throw. Only in that case use HOME as a fallback and retry once. A duplicate
+        // accessibility event must never send an already visible BlockActivity back to HOME.
+        delay(BLOCK_VISIBILITY_TIMEOUT_MS)
+        if (!BlockActivity.isVisible) {
+            withContext(Dispatchers.Main.immediate) { performHome() }
+            delay(HOME_FALLBACK_DELAY_MS)
+            withContext(Dispatchers.Main.immediate) { launchBlockActivity(lock) }
+        }
+    }
+
+    private fun launchBlockActivity(lock: LockStateEntity): Boolean = runCatching {
+        val intent = Intent(context, BlockActivity::class.java).apply {
+            addFlags(
+                Intent.FLAG_ACTIVITY_NEW_TASK or
+                    Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                    Intent.FLAG_ACTIVITY_SINGLE_TOP or
+                    Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS
+            )
+            putExtra(BlockActivity.EXTRA_LOCK_TYPE, lock.lockType)
+        }
+        context.startActivity(intent)
+    }.isSuccess
+
+    private companion object {
+        const val BLOCK_VISIBILITY_TIMEOUT_MS = 500L
+        const val HOME_FALLBACK_DELAY_MS = 100L
     }
 }
