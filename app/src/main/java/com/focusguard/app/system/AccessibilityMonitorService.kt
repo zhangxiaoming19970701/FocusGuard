@@ -20,6 +20,8 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.lang.ref.WeakReference
 import javax.inject.Inject
 
 @AndroidEntryPoint
@@ -32,21 +34,36 @@ class AccessibilityMonitorService : AccessibilityService() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var screenReceiverRegistered = false
     private var heartbeatJob: Job? = null
+    private var foregroundRecoveryJob: Job? = null
+    private var shutdownHandled = false
 
     private val screenReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
-            if (intent?.action == Intent.ACTION_SCREEN_OFF) orchestrator.onScreenOff()
+            when (intent?.action) {
+                Intent.ACTION_SCREEN_OFF -> {
+                    foregroundRecoveryJob?.cancel()
+                    orchestrator.onScreenOff()
+                }
+                Intent.ACTION_SCREEN_ON -> {
+                    if (isDeviceReadyForMonitoring()) {
+                        scheduleForegroundRecovery("SCREEN_ON")
+                    }
+                }
+                Intent.ACTION_USER_PRESENT -> scheduleForegroundRecovery("USER_PRESENT")
+            }
         }
     }
 
     override fun onServiceConnected() {
         super.onServiceConnected()
+        shutdownHandled = false
+        connectedInstance = WeakReference(this)
         registerScreenReceiver()
         heartbeatJob?.cancel()
         heartbeatJob = serviceScope.launch {
             while (true) {
                 settingsStore.updateServiceState(true)
-                delay(5 * 60_000L)
+                delay(HEARTBEAT_INTERVAL_MS)
             }
         }
         serviceScope.launch {
@@ -54,10 +71,7 @@ class AccessibilityMonitorService : AccessibilityService() {
             settingsStore.updateServiceState(true)
             repository.audit(EventCodes.SERVICE_CONNECTED)
             NotificationHelper.clearProtectionFailure(this@AccessibilityMonitorService)
-            repository.audit(EventCodes.RECOVERY_COMPLETED, detail = "ACCESSIBILITY_CONNECTED")
-            usageStatsInspector.mostRecentForegroundPackage()?.let { recovered ->
-                orchestrator.onForegroundPackage(recovered) { performGlobalAction(GLOBAL_ACTION_HOME) }
-            }
+            scheduleForegroundRecovery("ACCESSIBILITY_CONNECTED")
         }
     }
 
@@ -69,25 +83,30 @@ class AccessibilityMonitorService : AccessibilityService() {
         val power = getSystemService(PowerManager::class.java)
         val keyguard = getSystemService(KeyguardManager::class.java)
         if (!power.isInteractive || keyguard.isKeyguardLocked) return
-        val pkg = event.packageName?.toString()?.takeIf { it.isNotBlank() } ?: return
+        val pkg = foregroundPackageFrom(event) ?: return
+        if (pkg != SYSTEM_UI_PACKAGE) foregroundRecoveryJob?.cancel()
         orchestrator.onForegroundPackage(pkg) {
             performGlobalAction(GLOBAL_ACTION_HOME)
         }
     }
 
     override fun onInterrupt() {
-        heartbeatJob?.cancel()
-        orchestrator.onServiceStopping()
-        markDisconnected("INTERRUPTED")
+        // This callback only asks an accessibility service to stop current feedback. It is not
+        // a lifecycle disconnection signal and the service may keep receiving events afterwards.
+        serviceScope.launch {
+            repository.audit(EventCodes.SERVICE_INTERRUPTED)
+        }
     }
 
     override fun onDestroy() {
-        if (screenReceiverRegistered) runCatching { unregisterReceiver(screenReceiver) }
-        heartbeatJob?.cancel()
-        orchestrator.onServiceStopping()
-        markDisconnected("DESTROYED")
+        stopMonitoring("DESTROYED")
         serviceScope.cancel()
         super.onDestroy()
+    }
+
+    override fun onUnbind(intent: Intent?): Boolean {
+        stopMonitoring("UNBOUND")
+        return super.onUnbind(intent)
     }
 
     private fun markDisconnected(reason: String) {
@@ -105,6 +124,7 @@ class AccessibilityMonitorService : AccessibilityService() {
         if (screenReceiverRegistered) return
         val filter = IntentFilter().apply {
             addAction(Intent.ACTION_SCREEN_OFF)
+            addAction(Intent.ACTION_SCREEN_ON)
             addAction(Intent.ACTION_USER_PRESENT)
         }
         if (Build.VERSION.SDK_INT >= 33) {
@@ -114,5 +134,90 @@ class AccessibilityMonitorService : AccessibilityService() {
             registerReceiver(screenReceiver, filter)
         }
         screenReceiverRegistered = true
+    }
+
+    private fun stopMonitoring(reason: String) {
+        if (shutdownHandled) return
+        shutdownHandled = true
+        if (screenReceiverRegistered) {
+            runCatching { unregisterReceiver(screenReceiver) }
+            screenReceiverRegistered = false
+        }
+        foregroundRecoveryJob?.cancel()
+        heartbeatJob?.cancel()
+        orchestrator.onServiceStopping()
+        if (connectedInstance?.get() === this) connectedInstance = null
+        markDisconnected(reason)
+    }
+
+    private fun foregroundPackageFrom(event: AccessibilityEvent): String? {
+        val eventPackage = event.packageName?.toString()?.takeIf { it.isNotBlank() }
+        if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return eventPackage
+        return activeWindowPackage() ?: eventPackage
+    }
+
+    @Suppress("DEPRECATION")
+    private fun activeWindowPackage(): String? {
+        val root = if (Build.VERSION.SDK_INT >= 33) getRootInActiveWindow(0) else rootInActiveWindow
+            ?: return null
+        return try {
+            root.packageName?.toString()?.takeIf { it.isNotBlank() }
+        } finally {
+            if (Build.VERSION.SDK_INT < 33) root.recycle()
+        }
+    }
+
+    private fun scheduleForegroundRecovery(reason: String) {
+        foregroundRecoveryJob?.cancel()
+        foregroundRecoveryJob = serviceScope.launch {
+            RECOVERY_DELAYS_MS.forEachIndexed { attempt, waitMillis ->
+                if (waitMillis > 0L) delay(waitMillis)
+                if (!isDeviceReadyForMonitoring()) return@forEachIndexed
+
+                val activeWindowPackage = withContext(Dispatchers.Main.immediate) {
+                    activeWindowPackage()
+                }
+                val recoveredPackage = activeWindowPackage
+                    ?.takeUnless { it == SYSTEM_UI_PACKAGE }
+                    ?: usageStatsInspector.mostRecentForegroundPackage(RECOVERY_LOOKBACK_MS)
+                        ?.takeUnless { it == SYSTEM_UI_PACKAGE }
+
+                if (recoveredPackage != null) {
+                    orchestrator.onForegroundPackage(recoveredPackage) {
+                        performGlobalAction(GLOBAL_ACTION_HOME)
+                    }
+                    repository.audit(
+                        EventCodes.RECOVERY_COMPLETED,
+                        packageName = recoveredPackage,
+                        detail = "$reason:${attempt + 1}"
+                    )
+                    return@launch
+                }
+            }
+        }
+    }
+
+    private fun isDeviceReadyForMonitoring(): Boolean {
+        val power = getSystemService(PowerManager::class.java)
+        val keyguard = getSystemService(KeyguardManager::class.java)
+        return power.isInteractive && !keyguard.isKeyguardLocked
+    }
+
+    companion object {
+        private const val SYSTEM_UI_PACKAGE = "com.android.systemui"
+        private const val HEARTBEAT_INTERVAL_MS = 10 * 60_000L
+        private const val RECOVERY_LOOKBACK_MS = 5 * 60_000L
+        private val RECOVERY_DELAYS_MS = longArrayOf(0L, 250L, 1_000L, 2_500L)
+
+        @Volatile
+        private var connectedInstance: WeakReference<AccessibilityMonitorService>? = null
+
+        fun isRuntimeConnected(): Boolean = connectedInstance?.get() != null
+
+        fun requestForegroundRecheck(reason: String): Boolean {
+            val service = connectedInstance?.get() ?: return false
+            service.scheduleForegroundRecovery(reason)
+            return true
+        }
     }
 }
