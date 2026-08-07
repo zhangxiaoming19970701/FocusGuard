@@ -16,6 +16,7 @@ import com.focusguard.app.system.AppCatalog
 import com.focusguard.app.system.InstalledApp
 import com.focusguard.app.system.PermissionHealth
 import com.focusguard.app.system.PermissionUtils
+import com.focusguard.app.system.SERVICE_STALE_AFTER_MS
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.delay
@@ -138,7 +139,7 @@ class MainViewModel @Inject constructor(
                 context,
                 core.settings.serviceConnected &&
                     core.settings.lastServiceEventWall > 0L &&
-                    System.currentTimeMillis() - core.settings.lastServiceEventWall < 10 * 60_000L
+                    System.currentTimeMillis() - core.settings.lastServiceEventWall < SERVICE_STALE_AFTER_MS
             ),
             adminAuthenticated = aux.authenticated,
             message = aux.message,
@@ -154,7 +155,7 @@ class MainViewModel @Inject constructor(
         viewModelScope.launch {
             while (true) {
                 healthPulse.value = System.currentTimeMillis()
-                delay(2_000L)
+                delay(30_000L)
             }
         }
     }
