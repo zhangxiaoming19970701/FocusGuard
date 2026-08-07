@@ -685,8 +685,11 @@ private fun openNotificationSettings(context: Context) = context.startActivity(
 private fun openBatterySettings(context: Context) = context.startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
 
 private fun copyDiagnostics(context: Context, state: MainUiState) {
+    val versionName = runCatching {
+        context.packageManager.getPackageInfo(context.packageName, 0).versionName
+    }.getOrNull().orEmpty().ifBlank { "unknown" }
     val text = buildString {
-        appendLine("FocusGuard 0.1.0")
+        appendLine("FocusGuard $versionName")
         appendLine("Android ${android.os.Build.VERSION.RELEASE} API ${android.os.Build.VERSION.SDK_INT}")
         appendLine("${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}")
         appendLine("accessibility=${state.health.accessibilityEnabled}")
