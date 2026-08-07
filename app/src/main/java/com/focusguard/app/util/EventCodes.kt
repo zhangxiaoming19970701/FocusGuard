@@ -40,4 +40,5 @@ object EndReasons {
     const val LIMIT_REACHED = "LIMIT_REACHED"
     const val SERVICE_STOP = "SERVICE_STOP"
     const val STALE_RECOVERY = "STALE_RECOVERY"
+    const val RULE_CHANGED = "RULE_CHANGED"
 }
