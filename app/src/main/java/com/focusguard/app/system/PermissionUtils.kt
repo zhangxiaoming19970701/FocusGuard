@@ -16,7 +16,9 @@ object PermissionUtils {
             context.contentResolver,
             Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
         ).orEmpty()
-        return enabled.split(':').any { it.equals(expected, ignoreCase = true) }
+        return enabled.split(':')
+            .mapNotNull(ComponentName::unflattenFromString)
+            .any { it == ComponentName.unflattenFromString(expected) }
     }
 
     fun hasUsageAccess(context: Context): Boolean {
