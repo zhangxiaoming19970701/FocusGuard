@@ -158,7 +158,7 @@ class AccessibilityMonitorService : AccessibilityService() {
 
     @Suppress("DEPRECATION")
     private fun activeWindowPackage(): String? {
-        val root = if (Build.VERSION.SDK_INT >= 33) getRootInActiveWindow(0) else rootInActiveWindow
+        val root = (if (Build.VERSION.SDK_INT >= 33) getRootInActiveWindow(0) else rootInActiveWindow)
             ?: return null
         return try {
             root.packageName?.toString()?.takeIf { it.isNotBlank() }
