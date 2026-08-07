@@ -16,7 +16,10 @@ import com.focusguard.app.domain.PasswordHasher
 import com.focusguard.app.system.ClockProvider
 import com.focusguard.app.util.EventCodes
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.withContext
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -27,6 +30,9 @@ class FocusGuardRepository @Inject constructor(
     private val hasher: PasswordHasher,
     private val clock: ClockProvider
 ) {
+    private val _configurationChanges = MutableSharedFlow<String>(extraBufferCapacity = 16)
+    val configurationChanges: SharedFlow<String> = _configurationChanges.asSharedFlow()
+
     val managedApps: Flow<List<ManagedAppEntity>> = db.managedAppDao().observeAll()
     val rules: Flow<List<RuleEntity>> = db.ruleDao().observeAll()
     val lockState: Flow<LockStateEntity?> = db.lockStateDao().observe()
@@ -62,6 +68,7 @@ class FocusGuardRepository @Inject constructor(
                 )
             )
         }
+        _configurationChanges.emit(app.packageName)
     }
 
     suspend fun upsertRule(rule: RuleEntity) {
@@ -71,14 +78,19 @@ class FocusGuardRepository @Inject constructor(
                 AuditEventEntity(eventType = EventCodes.RULE_CHANGED, packageName = rule.packageName, detailCode = "RULE_UPSERT")
             )
         }
+        _configurationChanges.emit(rule.packageName)
     }
 
-    suspend fun upsertSchedule(window: ScheduleWindowEntity): Long = db.withTransaction {
-        val id = db.scheduleDao().upsert(window)
-        db.auditEventDao().insert(
-            AuditEventEntity(eventType = EventCodes.RULE_CHANGED, packageName = window.packageName, detailCode = "SCHEDULE_UPSERT")
-        )
-        id
+    suspend fun upsertSchedule(window: ScheduleWindowEntity): Long {
+        val id = db.withTransaction {
+            val generated = db.scheduleDao().upsert(window)
+            db.auditEventDao().insert(
+                AuditEventEntity(eventType = EventCodes.RULE_CHANGED, packageName = window.packageName, detailCode = "SCHEDULE_UPSERT")
+            )
+            generated
+        }
+        _configurationChanges.emit(window.packageName)
+        return id
     }
 
     suspend fun deleteSchedule(window: ScheduleWindowEntity) {
@@ -88,6 +100,7 @@ class FocusGuardRepository @Inject constructor(
                 AuditEventEntity(eventType = EventCodes.RULE_CHANGED, packageName = window.packageName, detailCode = "SCHEDULE_DELETE")
             )
         }
+        _configurationChanges.emit(window.packageName)
     }
 
     suspend fun dailyUsed(packageName: String, wall: Long, resetMinute: Int): Long {
