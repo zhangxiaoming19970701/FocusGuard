@@ -31,6 +31,21 @@ class BlockActivity : ComponentActivity() {
         }
     }
 
+    override fun onStart() {
+        super.onStart()
+        isVisible = true
+    }
+
+    override fun onStop() {
+        isVisible = false
+        super.onStop()
+    }
+
+    override fun onDestroy() {
+        isVisible = false
+        super.onDestroy()
+    }
+
     private fun goHome() {
         startActivity(
             Intent(Intent.ACTION_MAIN).apply {
@@ -43,5 +58,9 @@ class BlockActivity : ComponentActivity() {
 
     companion object {
         const val EXTRA_LOCK_TYPE = "lock_type"
+
+        @Volatile
+        var isVisible: Boolean = false
+            private set
     }
 }
